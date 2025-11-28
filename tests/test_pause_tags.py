@@ -1,12 +1,19 @@
 """
 Tests for the pause tags functionality [pause:xx]
+
+The parse_pause_tags function is defined inline here rather than imported
+from chatterbox.tts because:
+1. The chatterbox module has heavy dependencies (torch, huggingface, etc.)
+   that are not needed for testing this pure-Python parsing logic
+2. This keeps tests fast and CI-friendly
+3. The implementation below is a copy of the production code in tts.py
+
+Note: If the production implementation changes, this copy should be updated
+to match. The function signature and behavior should remain identical.
 """
 
 import re
 import pytest
-
-# Import the functions directly from tts.py's source
-# Re-implement for testing since the package has complex dependencies
 
 
 def parse_pause_tags(text: str):
@@ -127,7 +134,8 @@ class TestParsePauseTags:
         assert result == [("", 0.0)]
     
     def test_none_text(self):
-        """Test None text (handled by empty check)"""
+        """Test None text (handled by falsy check in 'if not text')"""
+        # The production code uses 'if not text:' which handles None correctly
         result = parse_pause_tags(None)
         assert result == [("", 0.0)]
     
