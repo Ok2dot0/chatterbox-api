@@ -1,0 +1,278 @@
+"""
+Chatterbox TTS HTTP API Server
+
+A FastAPI-based HTTP API for the Chatterbox Text-to-Speech system.
+Supports the [pause:Xs] custom pause tag feature (e.g., [pause:0.5s], [pause:1.0s]).
+
+Usage:
+    uvicorn api_server:app --host 0.0.0.0 --port 8000
+
+API Endpoints:
+    POST /tts - Generate speech from text
+    GET /health - Health check endpoint
+"""
+
+import io
+import os
+import tempfile
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import torch
+import torchaudio
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+# Global model instance
+model = None
+multilingual_model = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup: Pre-load the model if PRELOAD_MODEL is set
+    if os.environ.get("PRELOAD_MODEL", "false").lower() == "true":
+        get_model()
+    yield
+    # Shutdown: cleanup if needed
+    pass
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Chatterbox TTS API",
+    description="HTTP API for Chatterbox Text-to-Speech with support for [pause:Xs] tags (e.g., [pause:0.5s])",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+def get_device():
+    """Detect the best available device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def get_model():
+    """Get or initialize the TTS model."""
+    global model
+    if model is None:
+        from chatterbox.tts import ChatterboxTTS
+        device = get_device()
+        print(f"Loading ChatterboxTTS model on {device}...")
+        model = ChatterboxTTS.from_pretrained(device=device)
+        print("Model loaded successfully!")
+    return model
+
+
+def get_multilingual_model():
+    """Get or initialize the multilingual TTS model."""
+    global multilingual_model
+    if multilingual_model is None:
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        device = get_device()
+        print(f"Loading ChatterboxMultilingualTTS model on {device}...")
+        multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+        print("Multilingual model loaded successfully!")
+    return multilingual_model
+
+
+class TTSRequest(BaseModel):
+    """Request model for TTS generation."""
+    text: str = Field(..., description="Text to synthesize. Supports [pause:Xs] tags for custom pauses (e.g., [pause:0.5s]).")
+    exaggeration: float = Field(default=0.5, ge=0.0, le=2.0, description="Emotion exaggeration level (0.5 = neutral)")
+    cfg_weight: float = Field(default=0.5, ge=0.0, le=1.0, description="CFG weight for pace control")
+    temperature: float = Field(default=0.8, ge=0.05, le=5.0, description="Sampling temperature")
+    repetition_penalty: float = Field(default=1.2, ge=1.0, le=2.0, description="Repetition penalty")
+    min_p: float = Field(default=0.05, ge=0.0, le=1.0, description="Min-p sampling parameter")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p sampling parameter")
+    use_auto_editor: bool = Field(default=False, description="Enable artifact cleaning")
+    ae_threshold: float = Field(default=0.06, ge=0.0, le=1.0, description="Auto-editor volume threshold")
+    ae_margin: float = Field(default=0.2, ge=0.0, le=1.0, description="Auto-editor boundary protection")
+
+
+class MultilingualTTSRequest(BaseModel):
+    """Request model for multilingual TTS generation."""
+    text: str = Field(..., description="Text to synthesize")
+    language_id: str = Field(..., description="Language code (e.g., 'en', 'fr', 'zh', 'ja')")
+    exaggeration: float = Field(default=0.5, ge=0.0, le=2.0, description="Emotion exaggeration level")
+    cfg_weight: float = Field(default=0.5, ge=0.0, le=1.0, description="CFG weight for pace control")
+    temperature: float = Field(default=0.8, ge=0.05, le=5.0, description="Sampling temperature")
+    repetition_penalty: float = Field(default=2.0, ge=1.0, le=3.0, description="Repetition penalty")
+    min_p: float = Field(default=0.05, ge=0.0, le=1.0, description="Min-p sampling parameter")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p sampling parameter")
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return JSONResponse({
+        "status": "healthy",
+        "device": get_device(),
+        "model_loaded": model is not None,
+        "multilingual_model_loaded": multilingual_model is not None,
+    })
+
+
+@app.get("/languages")
+async def list_languages():
+    """List supported languages for multilingual TTS."""
+    from chatterbox.mtl_tts import SUPPORTED_LANGUAGES
+    return JSONResponse({
+        "languages": SUPPORTED_LANGUAGES
+    })
+
+
+@app.post("/tts")
+async def text_to_speech(request: TTSRequest):
+    """
+    Generate speech from text.
+    
+    Supports [pause:Xs] tags for custom pauses. Example:
+    - "Hello[pause:0.5s]world" - 0.5 second pause between words
+    - "Wait[pause:1.0s]for it" - 1 second pause
+    
+    Returns: WAV audio file
+    """
+    try:
+        tts_model = get_model()
+        
+        # Generate audio
+        wav = tts_model.generate(
+            text=request.text,
+            exaggeration=request.exaggeration,
+            cfg_weight=request.cfg_weight,
+            temperature=request.temperature,
+            repetition_penalty=request.repetition_penalty,
+            min_p=request.min_p,
+            top_p=request.top_p,
+            use_auto_editor=request.use_auto_editor,
+            ae_threshold=request.ae_threshold,
+            ae_margin=request.ae_margin,
+        )
+        
+        # Convert to bytes
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, wav, tts_model.sr, format="wav")
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=speech.wav"}
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tts/with-voice")
+async def text_to_speech_with_voice(
+    text: str = Form(..., description="Text to synthesize. Supports [pause:Xs] tags (e.g., [pause:0.5s])."),
+    voice_file: UploadFile = File(..., description="Reference voice audio file (WAV format)"),
+    exaggeration: float = Form(default=0.5),
+    cfg_weight: float = Form(default=0.5),
+    temperature: float = Form(default=0.8),
+    repetition_penalty: float = Form(default=1.2),
+    min_p: float = Form(default=0.05),
+    top_p: float = Form(default=1.0),
+    use_auto_editor: bool = Form(default=False),
+):
+    """
+    Generate speech with a custom voice reference.
+    
+    Upload a WAV file to clone the voice characteristics.
+    Supports [pause:Xs] tags for custom pauses (e.g., [pause:0.5s]).
+    
+    Returns: WAV audio file
+    """
+    try:
+        tts_model = get_model()
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            content = await voice_file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        try:
+            # Generate audio with voice reference
+            wav = tts_model.generate(
+                text=text,
+                audio_prompt_path=tmp_path,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                use_auto_editor=use_auto_editor,
+            )
+        finally:
+            # Clean up temp file
+            os.unlink(tmp_path)
+        
+        # Convert to bytes
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, wav, tts_model.sr, format="wav")
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=speech.wav"}
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tts/multilingual")
+async def multilingual_text_to_speech(request: MultilingualTTSRequest):
+    """
+    Generate multilingual speech from text.
+    
+    Supports 23 languages. Use /languages endpoint to see supported language codes.
+    
+    Returns: WAV audio file
+    """
+    try:
+        mtl_model = get_multilingual_model()
+        
+        # Generate audio
+        wav = mtl_model.generate(
+            text=request.text,
+            language_id=request.language_id,
+            exaggeration=request.exaggeration,
+            cfg_weight=request.cfg_weight,
+            temperature=request.temperature,
+            repetition_penalty=request.repetition_penalty,
+            min_p=request.min_p,
+            top_p=request.top_p,
+        )
+        
+        # Convert to bytes
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, wav, mtl_model.sr, format="wav")
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=speech.wav"}
+        )
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

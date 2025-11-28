@@ -43,11 +43,32 @@ Arabic (ar) • Danish (da) • German (de) • Greek (el) • English (en) • 
 
 
 # Installation
+
+## Option 1: Docker (Recommended for Production)
+
+The easiest way to run Chatterbox with HTTP API support:
+
+```shell
+# Clone the repository
+git clone https://github.com/resemble-ai/chatterbox.git
+cd chatterbox
+
+# Build and run with Docker Compose
+docker-compose up -d
+
+# The API will be available at http://localhost:8000
+```
+
+For GPU support, edit `docker-compose.yml` and uncomment the GPU configuration section.
+
+## Option 2: pip install
+
 ```shell
 pip install chatterbox-tts
 ```
 
-Alternatively, you can install from source:
+## Option 3: Install from source
+
 ```shell
 # conda create -yn chatterbox python=3.11
 # conda activate chatterbox
@@ -57,6 +78,71 @@ cd chatterbox
 pip install -e .
 ```
 We developed and tested Chatterbox on Python 3.11 on Debian 11 OS; the versions of the dependencies are pinned in `pyproject.toml` to ensure consistency. You can modify the code or dependencies in this installation mode.
+
+# HTTP API
+
+Chatterbox includes a FastAPI-based HTTP API for easy integration into your applications.
+
+## Running the API Server
+
+```shell
+# Install API dependencies
+pip install fastapi uvicorn python-multipart
+
+# Run the server
+python api_server.py
+# Or with uvicorn directly:
+uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+
+## API Endpoints
+
+### Health Check
+```shell
+curl http://localhost:8000/health
+```
+
+### List Supported Languages
+```shell
+curl http://localhost:8000/languages
+```
+
+### Generate Speech (English)
+```shell
+# Basic TTS
+curl -X POST http://localhost:8000/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world!"}' \
+  --output speech.wav
+
+# With custom pause tags
+curl -X POST http://localhost:8000/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello[pause:0.5s]world!", "exaggeration": 0.7}' \
+  --output speech.wav
+```
+
+### Generate Speech with Voice Cloning
+```shell
+curl -X POST http://localhost:8000/tts/with-voice \
+  -F "text=Hello world!" \
+  -F "voice_file=@reference_voice.wav" \
+  --output speech.wav
+```
+
+### Generate Multilingual Speech
+```shell
+curl -X POST http://localhost:8000/tts/multilingual \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Bonjour le monde!", "language_id": "fr"}' \
+  --output speech.wav
+```
+
+## API Documentation
+
+When the server is running, visit:
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
 # Usage
 ```python
