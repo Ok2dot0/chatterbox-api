@@ -23,7 +23,6 @@ dependencies = [
     "spacy-pkuseg",
     "pykakasi==2.3.0",
     "gradio==5.44.1",
-    "russian-text-stresser @ git+https://github.com/Vuizur/add-stress-to-epub",
     "auto-editor>=27.0.0"
 ]
 
@@ -32,6 +31,9 @@ api = [
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
     "python-multipart>=0.0.6",
+]
+russian = [
+    "russian-text-stresser @ git+https://github.com/Vuizur/add-stress-to-epub",
 ]
 
 [project.urls]
