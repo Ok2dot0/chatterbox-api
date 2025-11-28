@@ -79,6 +79,16 @@ pip install -e .
 ```
 We developed and tested Chatterbox on Python 3.11 on Debian 11 OS; the versions of the dependencies are pinned in `pyproject.toml` to ensure consistency. You can modify the code or dependencies in this installation mode.
 
+### Optional: Enhanced Russian Text Processing
+
+For improved Russian TTS with stress marks, install the optional Russian support:
+
+```shell
+pip install -e ".[russian]"
+```
+
+Note: This installs `russian-text-stresser` which requires spacy 3.6.x. Due to dependency conflicts with gradio's typer version requirements, this is provided as an optional feature. Without this package, Russian TTS will still work, but stress marks won't be automatically added to the text.
+
 # HTTP API
 
 Chatterbox includes a FastAPI-based HTTP API for easy integration into your applications.
