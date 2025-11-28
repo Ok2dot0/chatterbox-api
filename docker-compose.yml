@@ -1,0 +1,25 @@
+services:
+  chatterbox-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PRELOAD_MODEL=true
+      - HF_HOME=/app/.cache/huggingface
+    volumes:
+      # Persist Hugging Face model cache
+      - huggingface-cache:/app/.cache/huggingface
+    # For GPU support, uncomment the following:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  huggingface-cache:
