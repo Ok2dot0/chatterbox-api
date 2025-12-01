@@ -230,6 +230,7 @@ class ChatterboxTTS:
         ae_threshold=0.06,
         ae_margin=0.2,
         disable_watermark=False,
+        speed: float = 1.0,
         max_segment_length=300,
         max_workers=None,  # None means auto-detect optimal value
     ):
@@ -264,6 +265,7 @@ class ChatterboxTTS:
                 ae_threshold=ae_threshold,
                 ae_margin=ae_margin,
                 disable_watermark=disable_watermark,
+                speed=speed,
                 max_workers=max_workers
             )
 
@@ -310,12 +312,13 @@ class ChatterboxTTS:
                     if os.path.exists(temp_audio_path):
                         os.unlink(temp_audio_path)
                     
-            return segment_audio
+            # Apply speed adjustment if requested
+            return apply_speed_tensor(segment_audio, self.sr, speed)
         
         # Process text with pauses - generate and clean each segment first, then add pauses
         audio_segments = []
         temp_files_to_cleanup = []
-        
+
         try:
             for text_segment, pause_duration in segments:
                 if text_segment.strip():  # Non-empty text segment
@@ -323,7 +326,7 @@ class ChatterboxTTS:
                     segment_audio = self._generate_single_segment(
                         text_segment, cfg_weight, temperature, repetition_penalty, min_p, top_p, disable_watermark
                     )
-                    
+
                     # 2. Clean artifacts for this segment
                     if use_auto_editor:
                         # Save temporary audio file
@@ -332,12 +335,12 @@ class ChatterboxTTS:
                             temp_audio_path = temp_file.name
                         temp_files_to_cleanup.append(temp_audio_path)
                         torchaudio.save(temp_audio_path, segment_audio, self.sr)
-                        
+
                         # Clean artifacts
                         cleaned_audio_path = self._clean_artifacts(temp_audio_path, ae_threshold, ae_margin)
                         if cleaned_audio_path != temp_audio_path:
                             temp_files_to_cleanup.append(cleaned_audio_path)
-                        
+
                         # Load cleaned audio
                         try:
                             if cleaned_audio_path != temp_audio_path:
@@ -346,22 +349,23 @@ class ChatterboxTTS:
                         except Exception as e:
                             print(f"[WARNING] Unable to load cleaned audio segment: {e}")
                             # Continue using original audio segment
-                    
+
                     audio_segments.append(segment_audio.squeeze(0))
-                
+
                 # 3. Add pause (after artifact cleaning)
                 if pause_duration > 0:
                     silence = create_silence(pause_duration, self.sr)
                     audio_segments.append(silence.squeeze(0))
-            
+
             # 4. Concatenate all audio segments
             if audio_segments:
                 final_audio = torch.cat(audio_segments, dim=0)
-                return final_audio.unsqueeze(0)
+                final_audio = final_audio.unsqueeze(0)
+                return apply_speed_tensor(final_audio, self.sr, speed)
             else:
                 # If no valid audio segments, return brief silence
-                return create_silence(0.1, self.sr)
-                
+                return apply_speed_tensor(create_silence(0.1, self.sr), self.sr, speed)
+
         finally:
             # Clean up all temporary files
             for temp_file in temp_files_to_cleanup:
@@ -384,6 +388,7 @@ class ChatterboxTTS:
         ae_threshold=0.06,
         ae_margin=0.2,
         disable_watermark=False,
+        speed: float = 1.0,
         max_workers=3
     ):
         """
@@ -434,9 +439,10 @@ class ChatterboxTTS:
         
         if final_audio_parts:
             final_audio = torch.cat(final_audio_parts, dim=0)
-            return final_audio.unsqueeze(0)
+            final_audio = final_audio.unsqueeze(0)
+            return apply_speed_tensor(final_audio, self.sr, speed)
         else:
-            return create_silence(0.1, self.sr)
+            return apply_speed_tensor(create_silence(0.1, self.sr), self.sr, speed)
 
 
 
@@ -700,3 +706,20 @@ def create_silence(duration_seconds: float, sample_rate: int) -> torch.Tensor:
     """
     num_samples = int(duration_seconds * sample_rate)
     return torch.zeros(1, num_samples)
+
+
+def apply_speed_tensor(wav_tensor: torch.Tensor, sample_rate: int, speed: float) -> torch.Tensor:
+    """
+    Apply time-stretching to a mono waveform tensor using librosa.
+    """
+    if speed is None or speed == 1.0:
+        return wav_tensor
+
+    try:
+        y = wav_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        # librosa.effects.time_stretch expects a 1D array
+        stretched = librosa.effects.time_stretch(y, rate=speed)
+        return torch.from_numpy(stretched).unsqueeze(0)
+    except Exception as e:
+        print(f"[WARNING] apply_speed_tensor failed: {e}")
+        return wav_tensor

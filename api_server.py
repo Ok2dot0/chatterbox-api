@@ -94,6 +94,7 @@ class TTSRequest(BaseModel):
     use_auto_editor: bool = Field(default=False, description="Enable artifact cleaning")
     ae_threshold: float = Field(default=0.06, ge=0.0, le=1.0, description="Auto-editor volume threshold")
     ae_margin: float = Field(default=0.2, ge=0.0, le=1.0, description="Auto-editor boundary protection")
+    speed: float = Field(default=1.0, ge=0.1, le=3.0, description="Playback speed multiplier (1.0 = normal)")
 
 
 class MultilingualTTSRequest(BaseModel):
@@ -106,6 +107,17 @@ class MultilingualTTSRequest(BaseModel):
     repetition_penalty: float = Field(default=2.0, ge=1.0, le=3.0, description="Repetition penalty")
     min_p: float = Field(default=0.05, ge=0.0, le=1.0, description="Min-p sampling parameter")
     top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p sampling parameter")
+
+
+class OpenAISpeechRequest(BaseModel):
+    """Compatibility model for OpenAI-style TTS requests (as in docs)."""
+    input: str = Field(..., description="Text to convert to speech", min_length=1, max_length=3000)
+    voice: Optional[str] = Field(default=None, description="Voice name or library id")
+    response_format: Optional[str] = Field(default="wav", description="Ignored - API returns WAV")
+    speed: float = Field(default=1.0, ge=0.1, le=3.0, description="Playback speed multiplier (1.0 = normal)")
+    exaggeration: Optional[float] = Field(default=None, ge=0.25, le=2.0)
+    cfg_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(default=None, ge=0.05, le=5.0)
 
 
 @app.get("/health")
@@ -154,6 +166,7 @@ async def text_to_speech(request: TTSRequest):
             use_auto_editor=request.use_auto_editor,
             ae_threshold=request.ae_threshold,
             ae_margin=request.ae_margin,
+            speed=request.speed,
         )
         
         # Convert to bytes
@@ -171,6 +184,64 @@ async def text_to_speech(request: TTSRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/audio/speech")
+async def openai_style_speech(req: OpenAISpeechRequest):
+    """OpenAI-compatible endpoint that maps `input` to local TTS generator and supports `speed`."""
+    try:
+        tts_model = get_model()
+
+        # Use provided override values or fall back to defaults
+        exaggeration = req.exaggeration if req.exaggeration is not None else 0.5
+        cfg_weight = req.cfg_weight if req.cfg_weight is not None else 0.5
+        temperature = req.temperature if req.temperature is not None else 0.8
+
+        wav = tts_model.generate(
+            text=req.input,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            speed=req.speed,
+        )
+
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, wav, tts_model.sr, format="wav")
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=speech.wav"}
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/models")
+async def list_models():
+    return JSONResponse({
+        "object": "list",
+        "data": [
+            {
+                "id": "chatterbox-tts-1",
+                "object": "model",
+                "created": 1677649963,
+                "owned_by": "resemble-ai",
+            }
+        ]
+    })
+
+
+@app.get("/config")
+async def get_config():
+    cfg = {
+        "server": {"host": "0.0.0.0", "port": int(os.environ.get("PORT", 8000))},
+        "model": {"device": get_device(), "voice_sample_path": os.environ.get("VOICE_SAMPLE_PATH", "./voice-sample.mp3"), "model_cache_dir": os.environ.get("MODEL_CACHE_DIR", "./models")},
+        "defaults": {"exaggeration": float(os.environ.get("EXAGGERATION", 0.5)), "cfg_weight": float(os.environ.get("CFG_WEIGHT", 0.5)), "temperature": float(os.environ.get("TEMPERATURE", 0.8)), "max_chunk_length": int(os.environ.get("MAX_CHUNK_LENGTH", 280)), "max_total_length": int(os.environ.get("MAX_TOTAL_LENGTH", 3000))}
+    }
+    return JSONResponse(cfg)
+
+
 @app.post("/tts/with-voice")
 async def text_to_speech_with_voice(
     text: str = Form(..., description="Text to synthesize. Supports [pause:Xs] tags (e.g., [pause:0.5s])."),
@@ -182,6 +253,7 @@ async def text_to_speech_with_voice(
     min_p: float = Form(default=0.05),
     top_p: float = Form(default=1.0),
     use_auto_editor: bool = Form(default=False),
+    speed: float = Form(default=1.0),
 ):
     """
     Generate speech with a custom voice reference.
@@ -212,6 +284,7 @@ async def text_to_speech_with_voice(
                 min_p=min_p,
                 top_p=top_p,
                 use_auto_editor=use_auto_editor,
+                speed=speed,
             )
         finally:
             # Clean up temp file
@@ -254,6 +327,7 @@ async def multilingual_text_to_speech(request: MultilingualTTSRequest):
             repetition_penalty=request.repetition_penalty,
             min_p=request.min_p,
             top_p=request.top_p,
+            speed=1.0,
         )
         
         # Convert to bytes
