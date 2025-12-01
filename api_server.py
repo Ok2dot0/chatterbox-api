@@ -15,6 +15,8 @@ API Endpoints:
 import io
 import os
 import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -25,61 +27,86 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 # Global model instance
-model = None
-multilingual_model = None
+class ModelManager:
+    def __init__(self, model_factory):
+        self.model_factory = model_factory
+        self.model = None
+        self.active_users = 0
+        self.lock = threading.Lock()
+        self.timer = None
+        self.unload_timeout = 5.0  # 5 seconds
 
+    def get(self):
+        return ModelContext(self)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown events."""
-    # Startup: Pre-load the model if PRELOAD_MODEL is set
-    if os.environ.get("PRELOAD_MODEL", "false").lower() == "true":
-        get_model()
-    yield
-    # Shutdown: cleanup if needed
-    pass
+    def _acquire(self):
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+            
+            if self.model is None:
+                self.model = self.model_factory()
+            
+            self.active_users += 1
+            return self.model
 
+    def _release(self):
+        with self.lock:
+            self.active_users -= 1
+            if self.active_users == 0:
+                self.timer = threading.Timer(self.unload_timeout, self.unload_model)
+                self.timer.start()
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Chatterbox TTS API",
-    description="HTTP API for Chatterbox Text-to-Speech with support for [pause:Xs] tags (e.g., [pause:0.5s])",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+    def unload_model(self):
+        with self.lock:
+            if self.active_users == 0 and self.model is not None:
+                print("Unloading model due to inactivity...")
+                del self.model
+                self.model = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                print("Model unloaded.")
 
+class ModelContext:
+    def __init__(self, manager):
+        self.manager = manager
+        self.model = None
 
-def get_device():
-    """Detect the best available device."""
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    def __enter__(self):
+        self.model = self.manager._acquire()
+        return self.model
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.manager._release()
 
-def get_model():
-    """Get or initialize the TTS model."""
-    global model
-    if model is None:
-        from chatterbox.tts import ChatterboxTTS
-        device = get_device()
-        print(f"Loading ChatterboxTTS model on {device}...")
-        model = ChatterboxTTS.from_pretrained(device=device)
-        print("Model loaded successfully!")
+def create_tts_model():
+    from chatterbox.tts import ChatterboxTTS
+    device = get_device()
+    print(f"Loading ChatterboxTTS model on {device}...")
+    model = ChatterboxTTS.from_pretrained(device=device)
+    print("Model loaded successfully!")
     return model
 
+def create_multilingual_model():
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    device = get_device()
+    print(f"Loading ChatterboxMultilingualTTS model on {device}...")
+    model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    print("Multilingual model loaded successfully!")
+    return model
+
+tts_manager = ModelManager(create_tts_model)
+multilingual_manager = ModelManager(create_multilingual_model)
+
+def get_model():
+    return tts_manager.get()
 
 def get_multilingual_model():
-    """Get or initialize the multilingual TTS model."""
-    global multilingual_model
-    if multilingual_model is None:
-        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-        device = get_device()
-        print(f"Loading ChatterboxMultilingualTTS model on {device}...")
-        multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-        print("Multilingual model loaded successfully!")
-    return multilingual_model
+    return multilingual_manager.get()
+
 
 
 class TTSRequest(BaseModel):
@@ -108,14 +135,44 @@ class MultilingualTTSRequest(BaseModel):
     top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p sampling parameter")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup: Pre-load the model if PRELOAD_MODEL is set
+    if os.environ.get("PRELOAD_MODEL", "false").lower() == "true":
+        with get_model():
+            pass
+    yield
+    # Shutdown: cleanup if needed
+    pass
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Chatterbox TTS API",
+    description="HTTP API for Chatterbox Text-to-Speech with support for [pause:Xs] tags (e.g., [pause:0.5s])",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+def get_device():
+    """Detect the best available device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
     return JSONResponse({
         "status": "healthy",
         "device": get_device(),
-        "model_loaded": model is not None,
-        "multilingual_model_loaded": multilingual_model is not None,
+        "model_loaded": tts_manager.model is not None,
+        "multilingual_model_loaded": multilingual_manager.model is not None,
     })
 
 
@@ -140,32 +197,31 @@ async def text_to_speech(request: TTSRequest):
     Returns: WAV audio file
     """
     try:
-        tts_model = get_model()
-        
-        # Generate audio
-        wav = tts_model.generate(
-            text=request.text,
-            exaggeration=request.exaggeration,
-            cfg_weight=request.cfg_weight,
-            temperature=request.temperature,
-            repetition_penalty=request.repetition_penalty,
-            min_p=request.min_p,
-            top_p=request.top_p,
-            use_auto_editor=request.use_auto_editor,
-            ae_threshold=request.ae_threshold,
-            ae_margin=request.ae_margin,
-        )
-        
-        # Convert to bytes
-        buffer = io.BytesIO()
-        torchaudio.save(buffer, wav, tts_model.sr, format="wav")
-        buffer.seek(0)
-        
-        return StreamingResponse(
-            buffer,
-            media_type="audio/wav",
-            headers={"Content-Disposition": "attachment; filename=speech.wav"}
-        )
+        with get_model() as tts_model:
+            # Generate audio
+            wav = tts_model.generate(
+                text=request.text,
+                exaggeration=request.exaggeration,
+                cfg_weight=request.cfg_weight,
+                temperature=request.temperature,
+                repetition_penalty=request.repetition_penalty,
+                min_p=request.min_p,
+                top_p=request.top_p,
+                use_auto_editor=request.use_auto_editor,
+                ae_threshold=request.ae_threshold,
+                ae_margin=request.ae_margin,
+            )
+            
+            # Convert to bytes
+            buffer = io.BytesIO()
+            torchaudio.save(buffer, wav, tts_model.sr, format="wav")
+            buffer.seek(0)
+            
+            return StreamingResponse(
+                buffer,
+                media_type="audio/wav",
+                headers={"Content-Disposition": "attachment; filename=speech.wav"}
+            )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -192,41 +248,40 @@ async def text_to_speech_with_voice(
     Returns: WAV audio file
     """
     try:
-        tts_model = get_model()
-        
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            content = await voice_file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-        
-        try:
-            # Generate audio with voice reference
-            wav = tts_model.generate(
-                text=text,
-                audio_prompt_path=tmp_path,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                use_auto_editor=use_auto_editor,
+        with get_model() as tts_model:
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                content = await voice_file.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+            
+            try:
+                # Generate audio with voice reference
+                wav = tts_model.generate(
+                    text=text,
+                    audio_prompt_path=tmp_path,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                    use_auto_editor=use_auto_editor,
+                )
+            finally:
+                # Clean up temp file
+                os.unlink(tmp_path)
+            
+            # Convert to bytes
+            buffer = io.BytesIO()
+            torchaudio.save(buffer, wav, tts_model.sr, format="wav")
+            buffer.seek(0)
+            
+            return StreamingResponse(
+                buffer,
+                media_type="audio/wav",
+                headers={"Content-Disposition": "attachment; filename=speech.wav"}
             )
-        finally:
-            # Clean up temp file
-            os.unlink(tmp_path)
-        
-        # Convert to bytes
-        buffer = io.BytesIO()
-        torchaudio.save(buffer, wav, tts_model.sr, format="wav")
-        buffer.seek(0)
-        
-        return StreamingResponse(
-            buffer,
-            media_type="audio/wav",
-            headers={"Content-Disposition": "attachment; filename=speech.wav"}
-        )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -242,30 +297,29 @@ async def multilingual_text_to_speech(request: MultilingualTTSRequest):
     Returns: WAV audio file
     """
     try:
-        mtl_model = get_multilingual_model()
-        
-        # Generate audio
-        wav = mtl_model.generate(
-            text=request.text,
-            language_id=request.language_id,
-            exaggeration=request.exaggeration,
-            cfg_weight=request.cfg_weight,
-            temperature=request.temperature,
-            repetition_penalty=request.repetition_penalty,
-            min_p=request.min_p,
-            top_p=request.top_p,
-        )
-        
-        # Convert to bytes
-        buffer = io.BytesIO()
-        torchaudio.save(buffer, wav, mtl_model.sr, format="wav")
-        buffer.seek(0)
-        
-        return StreamingResponse(
-            buffer,
-            media_type="audio/wav",
-            headers={"Content-Disposition": "attachment; filename=speech.wav"}
-        )
+        with get_multilingual_model() as mtl_model:
+            # Generate audio
+            wav = mtl_model.generate(
+                text=request.text,
+                language_id=request.language_id,
+                exaggeration=request.exaggeration,
+                cfg_weight=request.cfg_weight,
+                temperature=request.temperature,
+                repetition_penalty=request.repetition_penalty,
+                min_p=request.min_p,
+                top_p=request.top_p,
+            )
+            
+            # Convert to bytes
+            buffer = io.BytesIO()
+            torchaudio.save(buffer, wav, mtl_model.sr, format="wav")
+            buffer.seek(0)
+            
+            return StreamingResponse(
+                buffer,
+                media_type="audio/wav",
+                headers={"Content-Disposition": "attachment; filename=speech.wav"}
+            )
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
